@@ -1185,14 +1185,15 @@ swap_pager_haspage(vm_object_t object, vm_pindex_t pindex, int *before,
 
 	/*
 	 * do we have good backing store at the requested index ?
+	 * or is it a guard page ?
 	 */
 	blk0 = swp_pager_meta_lookup(object, pindex);
-	if (blk0 == SWAPBLK_NONE) {
+	if (blk0 == SWAPBLK_NONE || blk0 == SWAPBLK_GUARD) {
 		if (before)
 			*before = 0;
 		if (after)
 			*after = 0;
-		return (FALSE);
+		return (blk0 == SWAPBLK_GUARD);
 	}
 
 	/*
@@ -1203,8 +1204,13 @@ swap_pager_haspage(vm_object_t object, vm_pindex_t pindex, int *before,
 			if (i > pindex)
 				break;
 			blk = swp_pager_meta_lookup(object, pindex - i);
-			if (blk != blk0 - i)
-				break;
+			if (blk0 == SWAPBLK_ZERO){
+				if (blk != SWAPBLK_ZERO)
+					break;
+			} else {
+				if (blk != blk0 - i)
+					break;
+			}
 		}
 		*before = i - 1;
 	}
@@ -1215,8 +1221,13 @@ swap_pager_haspage(vm_object_t object, vm_pindex_t pindex, int *before,
 	if (after != NULL) {
 		for (i = 1; i < SWB_NPAGES; i++) {
 			blk = swp_pager_meta_lookup(object, pindex + i);
-			if (blk != blk0 + i)
-				break;
+			if (blk0 == SWAPBLK_ZERO){
+				if (blk != SWAPBLK_ZERO)
+					break;
+			} else {
+				if (blk != blk0 + i)
+					break;
+			}
 		}
 		*after = i - 1;
 	}
@@ -1285,7 +1296,8 @@ swap_pager_unswapped(vm_page_t m)
 		return;
 	if (sb->d[m->pindex % SWAP_META_PAGES] == SWAPBLK_NONE)
 		return;
-	swp_pager_freeswapspace(sb->d[m->pindex % SWAP_META_PAGES], 1);
+	if (~(sb->d[m->pindex % SWAP_META_PAGES] | SWAPBLK_MASK) != 0)
+		swp_pager_freeswapspace(sb->d[m->pindex % SWAP_META_PAGES], 1);
 	sb->d[m->pindex % SWAP_META_PAGES] = SWAPBLK_NONE;
 	swp_pager_free_empty_swblk(m->object, sb);
 }
@@ -1297,7 +1309,10 @@ swap_pager_unswapped(vm_page_t m)
  *	caller may optionally specify that additional pages preceding and
  *	succeeding the specified range be paged in.  The number of such pages
  *	is returned in the "rbehind" and "rahead" parameters, and they will
- *	be in the inactive queue upon return.
+ *	be in the inactive queue upon return. If the caller asks for more
+ *	than one page, they are expected to have called pager_haspage()
+ *	on the first page before and that all pages that are asked for
+ *	are in the range returned.
  *
  *	The pages in "ma" must be busied and will remain busied upon return.
  */
@@ -1324,6 +1339,16 @@ swap_pager_getpages_locked(vm_object_t object, vm_page_t *ma, int count,
 	KASSERT(reqcount - 1 <= maxahead,
 	    ("page count %d extends beyond swap block", reqcount));
 
+<<<<<<< HEAD
+=======
+	// if the page is a guard page fault on access
+	blk = swp_pager_meta_lookup(object, ma[0]->pindex);
+	if(blk == SWAPBLK_GUARD){
+		VM_OBJECT_WUNLOCK(object);
+		return(VM_PAGER_FAULT);
+	}
+
+>>>>>>> 43a987e6ece (Change get_pages according to clarification of input and to allow faulting in multiple zero pages)
 	/*
 	 * Do not transfer any pages other than those that are xbusied
 	 * when running during a split or collapse operation.  This
@@ -1351,6 +1376,49 @@ swap_pager_getpages_locked(vm_object_t object, vm_page_t *ma, int count,
 		mpred = TAILQ_PREV(ma[0], pglist, listq);
 		if (mpred != NULL && pindex - mpred->pindex - 1 < *rbehind)
 			*rbehind = pindex - mpred->pindex - 1;
+	}
+
+	blk = swp_pager_meta_lookup(object, ma[0]->pindex);
+	if(blk == SWAPBLK_ZERO){
+		if(rbehind)
+			*rbehind = 0;
+		if(rahead)
+			*rahead = 0;
+		for(i = 0; i < count; i++){
+			// zero out page
+			if(!(ma[i]->flags & PG_ZERO))
+				pmap_zero_page(ma[i]);
+			// set page flags
+			vm_page_set_validclean(ma[i], 0, PAGE_SIZE);
+		}
+		if (rbehind != NULL) {
+			for (i = 1; i <= *rbehind; i++) {
+				p = vm_page_alloc(object, ma[0]->pindex - i,
+					VM_ALLOC_ZERO);
+				if (p == NULL)
+					break;
+				if(!(p->flags & PG_ZERO))
+					pmap_zero_page(p);
+				// set page flags
+				vm_page_set_validclean(p, 0, PAGE_SIZE);
+			}
+			*rbehind = i - 1;
+		}
+		if (rahead != NULL) {
+			for (i = 0; i < *rahead; i++) {
+				p = vm_page_alloc(object,
+					ma[reqcount - 1]->pindex + i + 1, VM_ALLOC_ZERO);
+				if (p == NULL)
+					break;
+				if(!(p->flags & PG_ZERO))
+					pmap_zero_page(p);
+				// set page flags
+				vm_page_set_validclean(p, 0, PAGE_SIZE);
+			}
+			*rahead = i;
+		}
+		VM_OBJECT_WUNLOCK(object);
+		return(VM_PAGER_OK);
 	}
 
 	bm = ma[0];
@@ -1846,7 +1914,7 @@ swap_pager_swapped_pages(vm_object_t object)
 
 	if (pctrie_is_empty(&object->un_pager.swp.swp_blks))
 		return (0);
-
+	// TODO modify interface
 	for (res = 0, pi = 0; (sb = SWAP_PCTRIE_LOOKUP_GE(
 	    &object->un_pager.swp.swp_blks, pi)) != NULL;
 	    pi = sb->p + SWAP_META_PAGES) {
