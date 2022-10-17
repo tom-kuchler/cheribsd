@@ -244,9 +244,11 @@ _vm_object_allocate(objtype_t type, vm_pindex_t size, u_int flags,
 
 	object->type = type;
 	object->flags = flags;
-	if ((flags & OBJ_SWAP) != 0) {
+	if ((flags & OBJ_SWAP) != 0){
 		pctrie_init(&object->un_pager.swp.swp_blks);
-		object->un_pager.swp.writemappings = 0;
+#if __has_feature(capabilities)
+		pctrie_init(&object->un_pager.swp.swp_tgblks);
+#endif
 	}
 
 	/*

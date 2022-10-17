@@ -165,11 +165,15 @@ CTASSERT((PAGE_SIZE / CHERICAP_SIZE) % (8 * sizeof(uint64_t)) == 0);
  */
 struct swblk {
 	vm_pindex_t	p;
-#if __has_feature(capabilities)
-	uint64_t	swb_tags[SWAP_META_PAGES * BITS_PER_TAGS_PER_PAGE];
-#endif
 	daddr_t		d[SWAP_META_PAGES];
 };
+
+#if __has_feature(capabilities)
+struct tgblk {
+	vm_pindex_t p;
+	uint64_t	sw_tags[BITS_PER_TAGS_PER_PAGE];
+};
+#endif
 
 static MALLOC_DEFINE(M_VMPGDATA, "vm_pgdata", "swap pager private data");
 static struct mtx sw_dev_mtx;
@@ -439,6 +443,9 @@ static struct pagerlst	swap_pager_object_list[NOBJLISTS];
 static uma_zone_t swwbuf_zone;
 static uma_zone_t swrbuf_zone;
 static uma_zone_t swblk_zone;
+#if __has_feature(capabilities)
+static uma_zone_t tgblk_zone;
+#endif
 static uma_zone_t swpctrie_zone;
 
 /*
@@ -514,7 +521,11 @@ static daddr_t swp_pager_meta_build(vm_object_t, vm_pindex_t, daddr_t);
 #if __has_feature(capabilities)
 static void cheri_restore_tag(void * __capability *);
 static void swp_pager_meta_cheri_get_tags(vm_page_t);
+static struct tgblk* swp_pager_meta_cheri_get_tgblk(vm_object_t, vm_pindex_t);
+static struct tgblk* swp_pager_meta_cheri_add_meta(vm_object_t, vm_pindex_t);
 static void swp_pager_meta_cheri_put_tags(vm_page_t);
+static void swp_pager_meta_cheri_copy_tags(vm_object_t, struct tgblk*);
+static void swp_pager_meta_cheri_remove_tags(vm_object_t, vm_pindex_t);
 #endif
 static void swp_pager_meta_free(vm_object_t, vm_pindex_t, vm_pindex_t);
 static void swp_pager_meta_transfer(vm_object_t src, vm_object_t dst,
@@ -559,6 +570,26 @@ swblk_trie_free(struct pctrie *ptree, void *node)
 }
 
 PCTRIE_DEFINE(SWAP, swblk, p, swblk_trie_alloc, swblk_trie_free);
+
+#if __has_feature(capabilities)
+// Using same trie zone as normal swblk zone
+static void *
+tgblk_trie_alloc(struct pctrie *ptree)
+{
+
+	return (uma_zalloc(swpctrie_zone, M_NOWAIT | (curproc == pageproc ?
+	    M_USE_RESERVE : 0)));
+}
+
+static void
+tgblk_trie_free(struct pctrie *ptree, void *node)
+{
+
+	uma_zfree(swpctrie_zone, node);
+}
+
+PCTRIE_DEFINE(TAG, tgblk, p, tgblk_trie_alloc, tgblk_trie_free);
+#endif
 
 /*
  * SWP_SIZECHECK() -	update swap_pager_full indication
@@ -668,10 +699,19 @@ swap_pager_swap_init(void)
 	    pctrie_zone_init, NULL, UMA_ALIGN_PTR, 0);
 	swblk_zone = uma_zcreate("swblk", sizeof(struct swblk), NULL, NULL,
 	    NULL, NULL, _Alignof(struct swblk) - 1, 0);
+#if __has_feature(capabilities)
+	tgblk_zone = uma_zcreate("tgblk", sizeof(struct tgblk), NULL, NULL,
+		NULL, NULL, _Alignof(struct tgblk) -1, 0);
+#endif
 	n2 = n;
 	do {
 		if (uma_zone_reserve_kva(swblk_zone, n))
+#if (__has_feature(capabilities) == false)
 			break;
+#else
+			if (uma_zone_reserve_kva(tgblk_zone, n))
+				break;
+#endif
 		/*
 		 * if the allocation failed, try a zone two thirds the
 		 * size of the previous attempt.
@@ -1002,22 +1042,40 @@ sysctl_swap_fragmentation(SYSCTL_HANDLER_ARGS)
 }
 
 /*
- * SWAP_PAGER_FREESPACE() -	frees swap blocks associated with a page
+ * SWAP_PAGER_SETSPACE() -	sets swap blocks associated with a page
  *				range within an object.
  *
- *	This routine removes swapblk assignments from swap metadata.
+ *	This routine changes swapblk assignments from swap metadata.
  *
- *	The external callers of this routine typically have already destroyed
- *	or renamed vm_page_t's associated with this range in the object so
- *	we should be ok.
+ *	It can be used to remove assignments from swap metadate.
+ *	In that case, the external callers of this routine typically have
+ *	already destroyed or renamed vm_page_t's associated with this range
+ *	in the object so we should be ok.
  *
  *	The object must be locked.
  */
 static void
-swap_pager_freespace(vm_object_t object, vm_pindex_t start, vm_size_t size)
+swap_pager_setspace(vm_object_t object, vm_pindex_t start, vm_size_t size)
 {
 
-	swp_pager_meta_free(object, start, size);
+		VM_OBJECT_ASSERT_WLOCKED(object);
+		if ((object->type != OBJT_DEFAULT && object->type != OBJT_SWAP) || size == 0)
+			return;
+
+		new_blk = (type == VM_PAGER_SET_ZERO) ? SWAPBLK_ZERO : SWAPBLK_GUARD;
+		swp_pager_init_freerange(&s_free, &n_free);
+		last = start + size;
+		for (offset = start; offset < last; offset++) {
+			old_blk = swp_pager_meta_build(object, offset, new_blk);
+			if(~(old_blk | SWAPBLK_MASK) != 0){
+				swp_pager_update_freerange(&s_free, &n_free, old_blk);
+#if __has_feature(capabilities)
+				swp_pager_meta_cheri_remove_tags(object, offset);
+#endif
+			}
+		}
+		swp_pager_freeswapspace(s_free, n_free);
+	}
 }
 
 /*
@@ -1048,9 +1106,13 @@ swap_pager_reserve(vm_object_t object, vm_pindex_t start, vm_pindex_t size)
 		for (j = 0; j < n; ++j) {
 			addr = swp_pager_meta_build(object,
 			    start + i + j, blk + j);
-			if (addr != SWAPBLK_NONE)
+			if (~(addr | SWAPBLK_MASK) != 0){
 				swp_pager_update_freerange(&s_free, &n_free,
 				    addr);
+#if __has_feature(capabilities)
+				swp_pager_meta_cheri_remove_tags(object, start + i + j);
+#endif
+			}
 		}
 	}
 	swp_pager_freeswapspace(s_free, n_free);
@@ -1100,6 +1162,10 @@ swp_pager_xfer_source(vm_object_t srcobject, vm_object_t dstobject,
 	 */
 	VM_OBJECT_WUNLOCK(srcobject);
 	dstaddr = swp_pager_meta_build(dstobject, pindex, addr);
+#if __has_feature(capabilities)
+	swp_pager_meta_cheri_copy_tags(dstobject, 
+		swp_pager_meta_cheri_get_tgblk(srcobject, pindex));
+#endif
 	KASSERT(dstaddr == SWAPBLK_NONE,
 	    ("Unexpected destination swapblk"));
 	VM_OBJECT_WLOCK(srcobject);
@@ -1300,6 +1366,9 @@ swap_pager_unswapped(vm_page_t m)
 		swp_pager_freeswapspace(sb->d[m->pindex % SWAP_META_PAGES], 1);
 	sb->d[m->pindex % SWAP_META_PAGES] = SWAPBLK_NONE;
 	swp_pager_free_empty_swblk(m->object, sb);
+#if __has_feature(capabilities)
+	swp_pager_meta_cheri_remove_tags(obj, m->pindex);
+#endif
 }
 
 /*
@@ -1339,8 +1408,6 @@ swap_pager_getpages_locked(vm_object_t object, vm_page_t *ma, int count,
 	KASSERT(reqcount - 1 <= maxahead,
 	    ("page count %d extends beyond swap block", reqcount));
 
-<<<<<<< HEAD
-=======
 	// if the page is a guard page fault on access
 	blk = swp_pager_meta_lookup(object, ma[0]->pindex);
 	if(blk == SWAPBLK_GUARD){
@@ -1348,7 +1415,6 @@ swap_pager_getpages_locked(vm_object_t object, vm_page_t *ma, int count,
 		return(VM_PAGER_FAULT);
 	}
 
->>>>>>> 43a987e6ece (Change get_pages according to clarification of input and to allow faulting in multiple zero pages)
 	/*
 	 * Do not transfer any pages other than those that are xbusied
 	 * when running during a split or collapse operation.  This
@@ -1496,6 +1562,7 @@ swap_pager_getpages_locked(vm_object_t object, vm_page_t *ma, int count,
 	 *
 	 * NOTE: b_blkno is destroyed by the call to swapdev_strategy
 	 */
+	printf("swap_pager: I/O start pagein; blkno %ld,size %ld\n", blk,(long)(PAGE_SIZE * count));
 	BUF_KERNPROC(bp);
 	swp_pager_strategy(bp);
 
@@ -1513,7 +1580,7 @@ swap_pager_getpages_locked(vm_object_t object, vm_page_t *ma, int count,
 		    "swread", hz * 20)) {
 			printf(
 "swap_pager: indefinite wait buffer: bufobj: %p, blkno: %jd, size: %ld\n",
-			    bp->b_bufobj, (intmax_t)bp->b_blkno, bp->b_bcount);
+			    bp->b_bufobj, blk, (long)(PAGE_SIZE * count));
 		}
 	}
 	VM_OBJECT_WUNLOCK(object);
@@ -1755,6 +1822,14 @@ swp_pager_async_iodone(struct buf *bp)
 		    (long)bp->b_bcount,
 		    bp->b_error
 		);
+	} else {
+		printf(
+		    "swap_pager: I/O done - %s; blkno %ld,"
+			"size %ld\n",
+			((bp->b_iocmd == BIO_READ) ? "pagein" : "pageout"),
+		    (long)bp->b_blkno,
+		    (long)bp->b_bcount
+		);
 	}
 
 	/*
@@ -1919,7 +1994,7 @@ swap_pager_swapped_pages(vm_object_t object)
 	    &object->un_pager.swp.swp_blks, pi)) != NULL;
 	    pi = sb->p + SWAP_META_PAGES) {
 		for (i = 0; i < SWAP_META_PAGES; i++) {
-			if (sb->d[i] != SWAPBLK_NONE)
+			if (~(sb->d[i] | SWAPBLK_MASK) != 0)
 				res++;
 		}
 	}
@@ -2246,8 +2321,12 @@ allocated:
 	/*
 	 * Free the swblk if we end up with the empty page run.
 	 */
-	if (swapblk == SWAPBLK_NONE)
+	if (swapblk == SWAPBLK_NONE){
 		swp_pager_free_empty_swblk(object, sb);
+#if __has_feature(capabilities)
+		swp_pager_meta_cheri_remove_tags(object, pindex);
+#endif
+	}
 	return (prev_swapblk);
 }
 
@@ -2314,12 +2393,11 @@ swp_pager_meta_cheri_get_tags(vm_page_t page)
 	size_t i, j;
 	uint64_t t;
 	void * __capability *scan;
-	struct swblk *sb;
+	struct tgblk *sb;
 	vm_pindex_t modpi;
 
 	scan = (void *)PHYS_TO_DMAP(VM_PAGE_TO_PHYS(page));
-	sb = SWAP_PCTRIE_LOOKUP(&page->object->un_pager.swp.swp_blks,
-	    rounddown(page->pindex, SWAP_META_PAGES));
+	sb = TAG_PCTRIE_LOOKUP(&page->object->un_pager.swp.swp_tgblks, page->pindex);
 
 	modpi = page->pindex % SWAP_META_PAGES;
 	for (i = modpi * BITS_PER_TAGS_PER_PAGE;
@@ -2334,6 +2412,82 @@ swp_pager_meta_cheri_get_tags(vm_page_t page)
 }
 
 /*
+ *	swp_pager_meta_cheri_get_tgblk:
+ *
+ *	Get a pointer to a tag block containing tags for the page of an object.
+ */
+static struct tgblk*
+swp_pager_meta_cheri_get_tgblk(vm_object_t object, vm_pindex_t pindex){
+	return TAG_PCTRIE_LOOKUP(&object->un_pager.swp.swp_tgblks, pindex);
+}
+
+/*
+ *	swp_pager_meta_cheri_add_meta:
+ *
+ *	Add in a new node to the meta data and return a pointer to it
+ */
+static struct tgblk*
+swp_pager_meta_cheri_add_meta(vm_object_t object, vm_pindex_t pindex){
+	static volatile int tgblk_zone_exhausted, swpctrie_zone_exhausted;
+	struct tgblk *sb, *sb1;
+	int error;
+	sb = TAG_PCTRIE_LOOKUP(&object->un_pager.swp.swp_tgblks, pindex);
+	if (sb == NULL) {
+		for (;;) {
+			sb = uma_zalloc(tgblk_zone, M_NOWAIT | (curproc ==
+			    pageproc ? M_USE_RESERVE : 0));
+			if (sb != NULL) {
+				sb->p = pindex;
+				if (atomic_cmpset_int(&tgblk_zone_exhausted,
+				    1, 0))
+					printf("tgblk zone ok\n");
+				break;
+			}
+			VM_OBJECT_WUNLOCK(object);
+			if (uma_zone_exhausted(tgblk_zone)) {
+				if (atomic_cmpset_int(&tgblk_zone_exhausted,
+				    0, 1))
+					printf("tag blk zone exhausted, "
+					    "increase kern.maxswzone\n");
+				vm_pageout_oom(VM_OOM_SWAPZ);
+				pause("swzonxb", 10);
+			} else
+				uma_zwait(tgblk_zone);
+			VM_OBJECT_WLOCK(object);
+		}
+		for (;;) {
+			error = TAG_PCTRIE_INSERT(
+			    &object->un_pager.swp.swp_tgblks, sb);
+			if (error == 0) {
+				if (atomic_cmpset_int(&swpctrie_zone_exhausted,
+				    1, 0))
+					printf("swpctrie zone ok\n");
+				break;
+			}
+			VM_OBJECT_WUNLOCK(object);
+			if (uma_zone_exhausted(swpctrie_zone)) {
+				if (atomic_cmpset_int(&swpctrie_zone_exhausted,
+				    0, 1))
+					printf("swap pctrie zone exhausted, "
+					    "increase kern.maxswzone\n");
+				vm_pageout_oom(VM_OOM_SWAPZ);
+				pause("swzonxp", 10);
+			} else
+				uma_zwait(swpctrie_zone);
+			VM_OBJECT_WLOCK(object);
+			sb1 = TAG_PCTRIE_LOOKUP(&object->un_pager.swp.swp_tgblks,
+			    pindex);
+			if (sb1 != NULL) {
+				uma_zfree(tgblk_zone, sb);
+				sb = sb1;
+				break;
+			}
+		}
+	}
+	return sb;
+}
+
+/*
  *	swp_pager_meta_cheri_put_tags:
  *
  *	Save the capability tags of a page to its swap metadata structure.
@@ -2344,17 +2498,15 @@ swp_pager_meta_cheri_put_tags(vm_page_t page)
 	size_t i, j;
 	uint64_t t, m;
 	void * __capability *scan;
-	struct swblk *sb;
-	vm_pindex_t modpi;
+	struct tgblk *sb;
 	int tag;
 
 	scan = (void *)PHYS_TO_DMAP(VM_PAGE_TO_PHYS(page));
-	sb = SWAP_PCTRIE_LOOKUP(&page->object->un_pager.swp.swp_blks,
-	    rounddown(page->pindex, SWAP_META_PAGES));
+	sb = TAG_PCTRIE_LOOKUP(&page->object->un_pager.swp.swp_tgblks, page->pindex);
+	if (sb == NULL)
+		sb = swp_pager_meta_cheri_add_meta(page->object, page->pindex);
 
-	modpi = page->pindex % SWAP_META_PAGES;
-	for (i = modpi * BITS_PER_TAGS_PER_PAGE;
-	    i < (modpi + 1) * BITS_PER_TAGS_PER_PAGE; i++) {
+	for (i = 0; i < BITS_PER_TAGS_PER_PAGE; i++) {
 		t = 0;
 		m = 1;
 		for (j = 0; j < 8 * sizeof(uint64_t); j++) {
@@ -2364,8 +2516,45 @@ swp_pager_meta_cheri_put_tags(vm_page_t page)
 			m <<= 1;
 			scan++;
 		}
-		sb->swb_tags[i] = t;
+		sb->sw_tags[i] = t;
 	}
+}
+
+/*
+ *	swp_pager_meta_cheri_copy_tags:
+ *
+ * Copy the tgblk into the object, add a new tgblk in the object if it does
+ * not have one for the page that is described
+ */
+static void
+swp_pager_meta_cheri_copy_tags(vm_object_t object, struct tgblk* tags){
+	struct tgblk *sb;
+	size_t i;
+
+	if(tags == NULL)
+		return;
+
+	sb = TAG_PCTRIE_LOOKUP(&object->un_pager.swp.swp_tgblks, tags->p);
+	if(sb == NULL)
+		sb = swp_pager_meta_cheri_add_meta(object, tags->p);
+	for(i = 0; i < BITS_PER_TAGS_PER_PAGE; i++){
+		sb->sw_tags[i] = tags->sw_tags[i];
+	}
+}
+
+/*
+ *	swp_pager_meta_cheri_remove_tags:
+ *
+ *	Remove the capability tags of a page from the metadata structure.
+ */
+static void
+swp_pager_meta_cheri_remove_tags(vm_object_t object, vm_pindex_t pindex)
+{
+	struct tgblk *sb;
+	sb = TAG_PCTRIE_LOOKUP(&object->un_pager.swp.swp_tgblks, pindex);
+	if(sb != NULL)
+		TAG_PCTRIE_REMOVE(&object->un_pager.swp.swp_tgblks,
+			pindex);
 }
 #endif
 

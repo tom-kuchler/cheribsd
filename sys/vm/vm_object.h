@@ -166,11 +166,16 @@ struct vm_object {
 		 *		     invalid.
 		 *
 		 *	swp_blks -   pc-trie of the allocated swap blocks.
+		*
+		 *	swp_tgblks -   pc-trie of the allocated swap blocks tags.
 		 *
 		 */
 		struct {
 			void *swp_tmpfs;
 			struct pctrie swp_blks;
+#if __has_feature(capabilities)
+			struct pctrie swp_tgblks;
+#endif
 			vm_ooffset_t writemappings;
 		} swp;
 
