@@ -1276,10 +1276,13 @@ vm_object_advice_applies(vm_object_t object, int advice)
 
 	if ((object->flags & OBJ_UNMANAGED) != 0)
 		return (false);
-	if (advice != MADV_FREE)
-		return (true);
-	return ((object->flags & (OBJ_ONEMAPPING | OBJ_ANON)) ==
-	    (OBJ_ONEMAPPING | OBJ_ANON));
+	if((advice == MADV_ZERO || advice == MADV_RELEASE) &&
+		(object->type != OBJT_DEFAULT && object->type != OBJT_SWAP))
+		return (false);
+	if (advice == MADV_FREE)
+		return ((object->flags & (OBJ_ONEMAPPING | OBJ_ANON)) ==
+			(OBJ_ONEMAPPING | OBJ_ANON));
+	return(true);
 }
 
 static void
@@ -1288,7 +1291,7 @@ vm_object_madvise_freespace(vm_object_t object, int advice, vm_pindex_t pindex,
 {
 
 	if (advice == MADV_FREE)
-		vm_pager_freespace(object, pindex, size);
+		vm_pager_setspace(object, pindex, size, VM_PAGER_SET_NONE);
 }
 
 /*
@@ -1325,6 +1328,16 @@ vm_object_madvise(vm_object_t object, vm_pindex_t pindex, vm_pindex_t end,
 relookup:
 	VM_OBJECT_WLOCK(object);
 	if (!vm_object_advice_applies(object, advice)) {
+		VM_OBJECT_WUNLOCK(object);
+		return;
+	}
+	if(advice == MADV_ZERO){
+		vm_object_page_remove(object, pindex, end, OBJPR_PAGERZERO);
+		VM_OBJECT_WUNLOCK(object);
+		return;
+	}
+	if(advice == MADV_RELEASE){
+		vm_object_page_remove(object, pindex, end, OBJPR_PAGERGUARD);
 		VM_OBJECT_WUNLOCK(object);
 		return;
 	}
@@ -1799,7 +1812,7 @@ vm_object_collapse_scan(vm_object_t object)
 
 		if (p->pindex < backing_offset_index ||
 		    new_pindex >= object->size) {
-			vm_pager_freespace(backing_object, p->pindex, 1);
+			vm_pager_setspace(backing_object, p->pindex, 1, VM_PAGER_SET_NONE);
 
 			KASSERT(!pmap_page_is_mapped(p),
 			    ("freeing mapped page %p", p));
@@ -1848,7 +1861,7 @@ vm_object_collapse_scan(vm_object_t object)
 			 * page alone.  Destroy the original page from the
 			 * backing object.
 			 */
-			vm_pager_freespace(backing_object, p->pindex, 1);
+			vm_pager_setspace(backing_object, p->pindex, 1, VM_PAGER_SET_NONE);
 			KASSERT(!pmap_page_is_mapped(p),
 			    ("freeing mapped page %p", p));
 			if (vm_page_remove(p))
@@ -1872,8 +1885,8 @@ vm_object_collapse_scan(vm_object_t object)
 		}
 
 		/* Use the old pindex to free the right page. */
-		vm_pager_freespace(backing_object, new_pindex +
-		    backing_offset_index, 1);
+		vm_pager_setspace(backing_object, new_pindex +
+		    backing_offset_index, 1, VM_PAGER_SET_NONE);
 
 #if VM_NRESERVLEVEL > 0
 		/*
@@ -2065,11 +2078,18 @@ vm_object_page_remove(vm_object_t object, vm_pindex_t start, vm_pindex_t end,
     int options)
 {
 	vm_page_t p, next;
+	int pagerflag = VM_PAGER_SET_NONE;
 
 	VM_OBJECT_ASSERT_WLOCKED(object);
 	KASSERT((object->flags & OBJ_UNMANAGED) == 0 ||
 	    (options & (OBJPR_CLEANONLY | OBJPR_NOTMAPPED)) == OBJPR_NOTMAPPED,
 	    ("vm_object_page_remove: illegal options for object %p", object));
+	if(options & (OBJPR_PAGERZERO | OBJPR_PAGERGUARD)){
+		pagerflag = (options & OBJPR_PAGERZERO) ?
+			VM_PAGER_SET_ZERO : VM_PAGER_SET_GUARD;
+	}
+	vm_pager_setspace(object, start, (end == 0 ? object->size : end) -
+		start, pagerflag);
 	if (object->resident_page_count == 0)
 		return;
 	vm_object_pip_add(object, 1);
@@ -2146,9 +2166,6 @@ wired:
 		vm_page_free(p);
 	}
 	vm_object_pip_wakeup(object);
-
-	vm_pager_freespace(object, start, (end == 0 ? object->size : end) -
-	    start);
 }
 
 /*

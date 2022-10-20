@@ -190,6 +190,8 @@
 #define	MADV_NOCORE	8	/* do not include these pages in a core file */
 #define	MADV_CORE	9	/* revert to including pages in a core file */
 #define	MADV_PROTECT	10	/* protect process from pageout kill */
+#define	MADV_ZERO	11	/* immediately replace pages with zero pages */
+#define	MADV_RELEASE	12	/* remove pages from resource accounting and fault on access*/
 
 /*
  * Return bits from mincore

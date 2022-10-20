@@ -1369,10 +1369,14 @@ vm_fault_getpages(struct faultstate *fs, int *behindp, int *aheadp)
 	 * outside the range of the pager, clean up and return
 	 * an error.
 	 */
-	if (rv == VM_PAGER_ERROR || rv == VM_PAGER_BAD) {
+	if (rv == VM_PAGER_ERROR 
+		|| rv == VM_PAGER_BAD
+		|| rv == VM_PAGER_FAULT) {
 		VM_OBJECT_WLOCK(fs->object);
 		fault_page_free(&fs->m);
 		unlock_and_deallocate(fs);
+		if(rv == VM_PAGER_FAULT)
+			return(FAULT_PROTECTION_FAILURE);
 		return (FAULT_OUT_OF_BOUNDS);
 	}
 	KASSERT(rv == VM_PAGER_FAIL,
@@ -1624,7 +1628,7 @@ RetryFault:
 		case FAULT_OUT_OF_BOUNDS:
 			return (KERN_OUT_OF_BOUNDS);
 		case FAULT_PROTECTION_FAILURE:
-			return (KERN_PROTECTION_FAILURE);
+			return (KERN_INVALID_ADDRESS);
 		case FAULT_CONTINUE:
 			break;
 		default:

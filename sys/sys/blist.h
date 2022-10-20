@@ -65,8 +65,10 @@ typedef	uint64_t	u_daddr_t;	/* unsigned disk address */
  * a flag bit.
  */
 
-#define SWAPBLK_MASK	((daddr_t)((u_daddr_t)-1 >> 1))		/* mask */
-#define SWAPBLK_NONE	((daddr_t)((u_daddr_t)SWAPBLK_MASK + 1))/* flag */
+#define SWAPBLK_MASK	((daddr_t)((u_daddr_t)0x3))		/* mask */
+#define SWAPBLK_NONE	((daddr_t)((u_daddr_t)-2))		/* flag for non existing page */
+#define SWAPBLK_ZERO	((daddr_t)((u_daddr_t)-3))		/* flag for zero page */
+#define SWAPBLK_GUARD	((daddr_t)((u_daddr_t)-4))		/* flag for guard page */
 
 /*
  * Both blmeta and bm_bitmap MUST be a power of 2 in size.

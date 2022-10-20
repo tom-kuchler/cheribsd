@@ -259,6 +259,8 @@ struct vm_object {
 #define	OBJPR_CLEANONLY	0x1		/* Don't remove dirty pages. */
 #define	OBJPR_NOTMAPPED	0x2		/* Don't unmap pages. */
 #define	OBJPR_VALIDONLY	0x4		/* Ignore invalid pages. */
+#define	OBJPR_PAGERZERO 0x8		/* Set pages in pager to zero pages */
+#define	OBJPR_PAGERGUARD 0x10		/* Set pages in pager to guard pages */
 
 TAILQ_HEAD(object_q, vm_object);
 

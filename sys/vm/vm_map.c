@@ -3265,6 +3265,8 @@ vm_map_madvise(
 		break;
 	case MADV_WILLNEED:
 	case MADV_DONTNEED:
+	case MADV_ZERO:
+	case MADV_RELEASE:
 	case MADV_FREE:
 		if (start == end)
 			return (0);

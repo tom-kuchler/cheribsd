@@ -67,8 +67,8 @@ typedef void pgo_set_writeable_dirty_t(vm_object_t);
 typedef bool pgo_mightbedirty_t(vm_object_t);
 typedef void pgo_getvp_t(vm_object_t object, struct vnode **vpp,
     bool *vp_heldp);
-typedef void pgo_freespace_t(vm_object_t object, vm_pindex_t start,
-    vm_size_t size);
+typedef void pgo_setspace_t(vm_object_t object, vm_pindex_t start,
+    vm_size_t size, int type);
 
 struct pagerops {
 	int			pgo_kvme_type;
@@ -86,7 +86,7 @@ struct pagerops {
 	pgo_set_writeable_dirty_t *pgo_set_writeable_dirty;
 	pgo_mightbedirty_t	*pgo_mightbedirty;
 	pgo_getvp_t		*pgo_getvp;
-	pgo_freespace_t		*pgo_freespace;
+	pgo_setspace_t		*pgo_setspace;
 };
 
 extern const struct pagerops defaultpagerops;
@@ -106,6 +106,7 @@ extern const struct pagerops swaptmpfspagerops;
  * PEND	 operations was initiated but not completed
  * ERROR error while accessing data that is in range and exists
  * AGAIN temporary resource shortage prevented operation from happening
+ * FAULT pager has guard page for requested page, trigger access fault
  */
 #define	VM_PAGER_OK	0
 #define	VM_PAGER_BAD	1
@@ -113,11 +114,16 @@ extern const struct pagerops swaptmpfspagerops;
 #define	VM_PAGER_PEND	3
 #define	VM_PAGER_ERROR	4
 #define VM_PAGER_AGAIN	5
+#define VM_PAGER_FAULT	6
 
 #define	VM_PAGER_PUT_SYNC		0x0001
 #define	VM_PAGER_PUT_INVAL		0x0002
 #define	VM_PAGER_PUT_NOREUSE		0x0004
 #define VM_PAGER_CLUSTER_OK		0x0008
+
+#define VM_PAGER_SET_NONE	1
+#define VM_PAGER_SET_ZERO	2
+#define VM_PAGER_SET_GUARD	3
 
 #ifdef _KERNEL
 
@@ -239,14 +245,14 @@ vm_pager_getvp(vm_object_t object, struct vnode **vpp, bool *vp_heldp)
 }
 
 static __inline void
-vm_pager_freespace(vm_object_t object, vm_pindex_t start,
-    vm_size_t size)
+vm_pager_setspace(vm_object_t object, vm_pindex_t start,
+    vm_size_t size, int type)
 {
-	pgo_freespace_t *method;
+	pgo_setspace_t *method;
 
-	method = pagertab[object->type]->pgo_freespace;
+	method = pagertab[object->type]->pgo_setspace;
 	if (method != NULL)
-		method(object, start, size);
+		method(object, start, size, type);
 }
 
 int vm_pager_alloc_dyn_type(struct pagerops *ops, int base_type);
