@@ -526,7 +526,7 @@ static struct tgblk* swp_pager_meta_cheri_get_tgblk(vm_object_t, vm_pindex_t);
 static struct tgblk* swp_pager_meta_cheri_add_meta(vm_object_t, vm_pindex_t);
 static void swp_pager_meta_cheri_put_tags(vm_page_t);
 static void swp_pager_meta_cheri_copy_tags(vm_object_t, struct tgblk*);
-static void swp_pager_meta_cheri_remove_tags(vm_object_t, vm_pindex_t);
+static void swp_pager_meta_cheri_remove_tags(vm_object_t, vm_pindex_t, vm_pindex_t);
 #endif
 static void swp_pager_meta_free(vm_object_t, vm_pindex_t, vm_pindex_t);
 static void swp_pager_meta_transfer(vm_object_t src, vm_object_t dst,
@@ -570,7 +570,7 @@ swblk_trie_free(struct pctrie *ptree, void *node)
 	uma_zfree(swpctrie_zone, node);
 }
 
-PCTRIE_DEFINE(SWAP, swblk, last, swblk_trie_alloc, swblk_trie_free);
+PCTRIE_DEFINE(SWAP, swblk, first, swblk_trie_alloc, swblk_trie_free);
 
 #if __has_feature(capabilities)
 // Using same trie zone as normal swblk zone
@@ -1071,11 +1071,7 @@ swap_pager_setspace(vm_object_t object, vm_pindex_t start, vm_size_t size, int t
 		new_blk = (type == VM_PAGER_SET_ZERO) ? SWAPBLK_ZERO : SWAPBLK_GUARD;
 		swp_pager_meta_insert(object, start, size, new_blk, FALSE);
 #if __has_feature(capabilities)
-		vm_pindex_t offset, last;
-		last = start + size;
-		for (offset = start; offset < last; offset++) {
-				swp_pager_meta_cheri_remove_tags(object, offset);
-		}
+		swp_pager_meta_cheri_remove_tags(object, start, start + size);
 #endif
 	}
 }
@@ -1106,9 +1102,7 @@ swap_pager_reserve(vm_object_t object, vm_pindex_t start, vm_pindex_t size)
 		}
 		swp_pager_meta_insert(object, start+i, n, blk, FALSE);
 #if __has_feature(capabilities)
-		for (vm_pindex_t j = 0; j < n; ++j) {
-				swp_pager_meta_cheri_remove_tags(object, start + i + j);
-		}
+		swp_pager_meta_cheri_remove_tags(object, start + i, start + i + n);
 #endif
 	}
 	VM_OBJECT_WUNLOCK(object);
@@ -1124,7 +1118,7 @@ swap_pager_reserve(vm_object_t object, vm_pindex_t start, vm_pindex_t size)
  *	we keep the destination's.
  *
  *	This routine is allowed to sleep.  It may sleep allocating metadata
- *	indirectly through swp_pager_meta_build().
+ *	indirectly through swp_pager_meta_insert().
  *
  *	The source object contains no vm_page_t's (which is just as well)
  *
@@ -1191,8 +1185,8 @@ swap_pager_haspage(vm_object_t object, vm_pindex_t pindex, int *before,
 	 * or is it a guard page ?
 	 */
 
-	blk = SWAP_PCTRIE_LOOKUP_GE(&object->un_pager.swp.swp_blks, pindex);
-	if(blk == NULL || blk->first > pindex){
+	blk = SWAP_PCTRIE_LOOKUP_LE(&object->un_pager.swp.swp_blks, pindex);
+	if(blk == NULL || blk->last < pindex){
 		if (before)
 			*before = 0;
 		if (after)
@@ -1280,7 +1274,7 @@ swap_pager_unswapped(vm_page_t m)
 
 	swp_pager_meta_insert(m->object, m->pindex, 1, SWAPBLK_NONE, FALSE);
 #if __has_feature(capabilities)
-	swp_pager_meta_cheri_remove_tags(obj, m->pindex);
+	swp_pager_meta_cheri_remove_tags(obj, m->pindex, m->pindex+1);
 #endif
 }
 
@@ -2071,24 +2065,19 @@ next_obj:
  */
 
 /*
- * SWP_PAGER_META_ALLOC() - allocate space for a new node
+ * SWP_PAGER_META_INSERT_NODE() - insert a node into meta pctrie
  * 
- * Allocate a new node to insert into the trie
- * May sleep and release the lock on the object
+ * Allocate and insert a new node
+ * Returns either a pointer to the newly inserted node or NULL on failure
  */
-static struct swblk *swp_pager_meta_alloc(vm_object_t object)
+static struct swblk* swp_pager_meta_insert_node(vm_object_t object, vm_pindex_t pindex)
 {
-	static volatile int swblk_zone_exhausted;
+	static volatile int swpctrie_zone_exhausted, swblk_zone_exhausted;
 	struct swblk *sb;
-	for (;;) {
-		sb = uma_zalloc(swblk_zone, M_NOWAIT | (curproc ==
-			pageproc ? M_USE_RESERVE : 0));
-		if (sb != NULL) {
-			if (atomic_cmpset_int(&swblk_zone_exhausted,
-				1, 0))
-				printf("swblk zone ok\n");
-			break;
-		}
+	int error;
+
+	sb = uma_zalloc(swblk_zone, M_NOWAIT | (curproc == pageproc ? M_USE_RESERVE : 0));
+	if(sb == NULL){
 		VM_OBJECT_WUNLOCK(object);
 		if (uma_zone_exhausted(swblk_zone)) {
 			if (atomic_cmpset_int(&swblk_zone_exhausted,
@@ -2100,19 +2089,29 @@ static struct swblk *swp_pager_meta_alloc(vm_object_t object)
 		} else
 			uma_zwait(swblk_zone);
 		VM_OBJECT_WLOCK(object);
+		return NULL;
 	}
+	if (atomic_cmpset_int(&swblk_zone_exhausted,1, 0))
+		printf("swblk zone ok\n");
+	sb->first = pindex;
+	sb->last = pindex;
+	error = SWAP_PCTRIE_INSERT(&object->un_pager.swp.swp_blks, sb);
+	if(error != 0){
+		uma_zfree(swblk_zone, sb);
+		VM_OBJECT_WUNLOCK(object);
+		if (uma_zone_exhausted(swpctrie_zone)) {
+			if (atomic_cmpset_int(&swpctrie_zone_exhausted, 0, 1))
+				printf("swap pctrie zone exhausted increase kern.maxswzone\n");
+			vm_pageout_oom(VM_OOM_SWAPZ);
+			pause("swzonxp", 10);
+		} else
+			uma_zwait(swpctrie_zone);
+		VM_OBJECT_WLOCK(object);
+		return NULL;
+	}
+	if (atomic_cmpset_int(&swpctrie_zone_exhausted, 1, 0))
+		printf("swpctrie zone ok\n");
 	return sb;
-}
-
-/*
- * SWP_PAGER_META_ALLOC() - allocate space for a new node
- * 
- * Allocate a new node to insert into the trie
- * May sleep and release the lock on the object
- */
-static void swp_pager_meta_dealloc(struct swblk* sb)
-{
-	uma_zfree(swblk_zone, sb);
 }
 
 /* 
@@ -2127,107 +2126,125 @@ static void swp_pager_meta_dealloc(struct swblk* sb)
 static void
 swp_pager_meta_insert(vm_object_t object, vm_pindex_t pindex, vm_size_t count, daddr_t swapblk, boolean_t noFree)
 {
-	static volatile int swpctrie_zone_exhausted;
+	
 	struct swblk* new,* old;
 	daddr_t start, end;
 	vm_pindex_t start_free, number_free;
-	int error;
 
 	VM_OBJECT_ASSERT_WLOCKED(object);
 
-	new = swp_pager_meta_alloc(object);
 	start = pindex;
 	end = pindex + count -1;
-	// get block with end greater to or equal to our start page
-	// while there are block overlapping
-	for(old = SWAP_PCTRIE_LOOKUP_GE(&object->un_pager.swp.swp_blks, start);;
-		old = SWAP_PCTRIE_LOOKUP_GE(&object->un_pager.swp.swp_blks, start)
-		){
-		// TODO check merging opportunities
-		// no block with overlap found, attempt inserting
-		if(old == NULL || old->first > end){
-			if(swapblk == SWAPBLK_NONE)
-				return;
-			new->first = start;
-			new->last = end;
-			KASSERT(new->last >= new->first,
-				("%s: Inserting new swap meta data that is negative range", __func__));
-			new->daddr = swapblk;
-			error = SWAP_PCTRIE_INSERT(
-					&object->un_pager.swp.swp_blks, new);
-			if (error == 0) {
-				if (atomic_cmpset_int(&swpctrie_zone_exhausted,
-					1, 0))
-					printf("swpctrie zone ok\n");
-				return;
-			} else {
-				VM_OBJECT_WUNLOCK(object);
-				if (uma_zone_exhausted(swpctrie_zone)) {
-					if (atomic_cmpset_int(&swpctrie_zone_exhausted,
-						0, 1))
-						printf("swap pctrie zone exhausted, "
-							"increase kern.maxswzone\n");
-					vm_pageout_oom(VM_OOM_SWAPZ);
-					pause("swzonxp", 10);
-				} else
-					uma_zwait(swpctrie_zone);
-				VM_OBJECT_WLOCK(object);
-				// start again, to make sure the updates are consistent
-				continue;
+	// while there is a block before that overlaps
+	for(old = SWAP_PCTRIE_LOOKUP_LE(&object->un_pager.swp.swp_blks, start);;
+		old = SWAP_PCTRIE_LOOKUP_LE(&object->un_pager.swp.swp_blks, start)){
+		if(old == NULL){
+			if(swapblk != SWAPBLK_NONE){
+				new = swp_pager_meta_insert_node(object, start);
+				if(new == NULL)
+					continue;
+				new->last = end;
+				new->daddr = swapblk;
 			}
+			break;
 		}
-		start_free = old->daddr;
-		number_free = old->last+1 - old->first;
-		// insert a new node only containing part before start
-		if(start > old->first){
-			new->first = old->first;
-			new->daddr = old->daddr;
-			new->last = start-1;
-			start_free += start - old->first;
-			number_free -= start - old->first;
-			KASSERT(new->last >= new->first,
-				("%s: Reinserting old swap meta data that is negative range", __func__));
-			error = SWAP_PCTRIE_INSERT(&object->un_pager.swp.swp_blks, new);
-			if (error == 0) {
-				if (atomic_cmpset_int(&swpctrie_zone_exhausted, 1, 0))
-					printf("swpctrie zone ok\n");
-			} else {
-				VM_OBJECT_WUNLOCK(object);
-				if (uma_zone_exhausted(swpctrie_zone)) {
-					if (atomic_cmpset_int(&swpctrie_zone_exhausted, 0, 1))
-						printf("swap pctrie zone exhausted, "
-							"increase kern.maxswzone\n");
-					vm_pageout_oom(VM_OOM_SWAPZ);
-					pause("swzonxp", 10);
-				} else
-					uma_zwait(swpctrie_zone);
-				VM_OBJECT_WLOCK(object);
-				// start again, to make sure the updates are consistent
-				continue;
-			}
-			new = NULL;
-		}
-		if(end >= old->last){
-			SWAP_PCTRIE_REMOVE(&object->un_pager.swp.swp_blks, old->last);
-			if(new == NULL)
+		if(old->last >= start-1){
+			if((~(swapblk | SWAPBLK_MASK) == 0 && swapblk == old->daddr) ||
+				(~(swapblk | SWAPBLK_MASK) != 0 && swapblk == old->daddr + start - old->first)){
+				old->last = MAX(end, old->last);
+				end = old->last;
 				new = old;
-			else
-				swp_pager_meta_dealloc(old);
-		} else {
-			old->first = end + 1;
-			number_free -= old->last - end;
-			if(~(old->daddr | SWAPBLK_MASK) != 0)
-				old->daddr = start_free + number_free;
-			KASSERT(old->last >= old->first,
-				("%s: Modifying swap meta data to become negative range", __func__));
+				break;
+			}
 		}
-		// update swap bookkeeping and daddr
-		if((~(start_free | SWAPBLK_MASK) != 0) && (!noFree))
+		// non overlap, non merge case
+		if(old->last < start){
+			if(swapblk != SWAPBLK_NONE){
+				new = swp_pager_meta_insert_node(object, start);
+				if(new == NULL)
+					continue;
+				new->last = end;
+				new->daddr = swapblk;
+			}
+			break;
+		}
+		// deal with splitting
+		if(old->last > end){
+			new = swp_pager_meta_insert_node(object, end+1);
+			if(new == NULL)
+				continue;
+			new->last = old->last;
+			new->daddr = old->daddr;
+			if(~(old->daddr | SWAPBLK_MASK) != 0){
+				new->daddr += end+1 - old->first;
+			}
+			old->last = end;
+		}
+		// always end >= old->last
+		KASSERT(end >= old->last,
+			("%s: old not correctly split", __func__));
+		start_free = old->daddr;
+		if(~(start_free | SWAPBLK_MASK) != 0)
+			start_free += start - old->first;
+		number_free = old->last+1 - start;
+		if(old->first == start){
+			if(swapblk == SWAPBLK_NONE){
+				SWAP_PCTRIE_REMOVE(&object->un_pager.swp.swp_blks, start);
+				uma_zfree(swblk_zone, old);
+			} else {
+				old->last = end;
+				old->daddr = swapblk;
+			}
+		} else {
+			if(swapblk != SWAPBLK_NONE){
+				new = swp_pager_meta_insert_node(object, start);
+				if(new == NULL)
+					continue;
+				new->last = end;
+				new->daddr = swapblk;
+			}
+			old->last = start-1;
+		}
+		if(~(start_free | SWAPBLK_MASK) != 0 && !noFree){
 			swp_pager_freeswapspace(start_free, number_free);
-
-		// if we have used new and not gotten one back allocate a new one
-		if(new == NULL)
-			new = swp_pager_meta_alloc(object);
+		}
+		break;
+	}
+	// there is no more block overlapping with start
+	// take care of all blocks comming after start
+	for(old = SWAP_PCTRIE_LOOKUP_GE(&object->un_pager.swp.swp_blks, start+1);
+		old != NULL;
+		old = SWAP_PCTRIE_LOOKUP_GE(&object->un_pager.swp.swp_blks, start+1)
+		){
+		// check for merging
+		if(old->first <= end-1 && swapblk != SWAPBLK_NONE){
+			if((~(swapblk | SWAPBLK_MASK) == 0 && swapblk == old->daddr) || 
+				(~(swapblk | SWAPBLK_MASK) != 0 && swapblk + end - old->first == old->daddr)){
+				new->last = MIN(end, old->last);
+				end = new->last;
+				SWAP_PCTRIE_REMOVE(&object->un_pager.swp.swp_blks, old->first);
+				uma_zfree(swblk_zone, old);
+				continue;
+			}
+		}
+		if(old->first > end)
+			break;
+		start_free = old->daddr;
+		number_free = MIN(old->last, end)+1 - old->first;
+		if(~(start_free | SWAPBLK_MASK) != 0 && !noFree){
+			swp_pager_freeswapspace(start_free, number_free);
+		}
+		SWAP_PCTRIE_REMOVE(&object->un_pager.swp.swp_blks, old->first);
+		if(old->last > end){
+			if(~(start_free | SWAPBLK_MASK) != 0)
+				old->daddr += end+1 - old->first;
+			old->first = end+1;
+			// can insert without error check as we know there is space
+			SWAP_PCTRIE_INSERT(&object->un_pager.swp.swp_blks, old);
+			break;
+		} else {
+			uma_zfree(swblk_zone, old);
+		}
 	}
 }
 
@@ -2259,9 +2276,9 @@ swp_pager_meta_transfer(vm_object_t srcobject, vm_object_t dstobject,
 
 	offset = pindex;
 	last = pindex + count;
-	for(old = SWAP_PCTRIE_LOOKUP_GE(&srcobject->un_pager.swp.swp_blks, pindex);
-		old != NULL && old->first < last;
-		old = SWAP_PCTRIE_LOOKUP_GE(&srcobject->un_pager.swp.swp_blks, pindex)
+	for(old = SWAP_PCTRIE_LOOKUP_LE(&srcobject->un_pager.swp.swp_blks, last-1);
+		old != NULL && old->last < pindex;
+		old = SWAP_PCTRIE_LOOKUP_LE(&srcobject->un_pager.swp.swp_blks, last-1)
 	){
 		// figure out start of affected range
 		start = MAX(pindex, old->first);
@@ -2274,20 +2291,26 @@ swp_pager_meta_transfer(vm_object_t srcobject, vm_object_t dstobject,
 					VM_OBJECT_WUNLOCK(srcobject);
 					tags->p = i - offset;
 					swp_pager_meta_cheri_copy_tags(dstobject, tags);
+					VM_OBJECT_WUNLOCK(dstobject);
 					VM_OBJECT_WLOCK(srcobject);
+					VM_OBJECT_WLOCK(dstobject);
+					continue;
 				}
 			}
 #endif
 			blk = old->daddr + start - old->first;
 			VM_OBJECT_WUNLOCK(srcobject);
 			swp_pager_meta_insert(dstobject, start-offset, end-start, blk, FALSE);
-			VM_OBJECT_WLOCK(srcobject);
-		}
-		if(dstobject != NULL)
 			VM_OBJECT_WUNLOCK(dstobject);
-		swp_pager_meta_insert(srcobject, start, end-start, SWAPBLK_NONE, TRUE);
-		if(dstobject != NULL)
+			VM_OBJECT_WLOCK(srcobject);
+			swp_pager_meta_insert(srcobject, start, end-start, SWAPBLK_NONE, TRUE);
 			VM_OBJECT_WLOCK(dstobject);
+		} else {
+			swp_pager_meta_insert(srcobject, start, end-start, SWAPBLK_NONE, FALSE);
+		}
+#if __has_feature(capabilities)
+		swp_pager_meta_cheri_remove_tags(srcobject, start, end);
+#endif
 	}
 }
 
@@ -2516,13 +2539,14 @@ swp_pager_meta_cheri_copy_tags(vm_object_t object, struct tgblk* tags){
  *	Remove the capability tags of a page from the metadata structure.
  */
 static void
-swp_pager_meta_cheri_remove_tags(vm_object_t object, vm_pindex_t pindex)
+swp_pager_meta_cheri_remove_tags(vm_object_t object, vm_pindex_t start, vm_pindex_t end)
 {
 	struct tgblk *sb;
-	sb = TAG_PCTRIE_LOOKUP(&object->un_pager.swp.swp_tgblks, pindex);
-	if(sb != NULL)
-		TAG_PCTRIE_REMOVE(&object->un_pager.swp.swp_tgblks,
-			pindex);
+	for(sb = TAG_PCTRIE_LOOKUP_GE(&object->un_pager.swp.swp_tgblks, start);
+		sb != NULL && sb->p < end;
+		sb = TAG_PCTRIE_LOOKUP_GE(&object->un_pager.swp.swp_tgblks, start)){
+		TAG_PCTRIE_REMOVE(&object->un_pager.swp.swp_tgblks, sb->p);
+	}	
 }
 #endif
 
@@ -2551,6 +2575,9 @@ swp_pager_meta_free(vm_object_t object, vm_pindex_t pindex, vm_pindex_t count)
 static void
 swp_pager_meta_free_all(vm_object_t object)
 {
+#if __has_feature(capabilities)
+	swp_pager_meta_cheri_remove_tags(object, 0, object->size);
+#endif
 	swp_pager_meta_insert(object, 0, object->size, SWAPBLK_NONE, FALSE);
 }
 
@@ -2579,8 +2606,8 @@ swp_pager_meta_lookup(vm_object_t object, vm_pindex_t pindex)
 	KASSERT((object->flags & OBJ_SWAP) != 0,
 	    ("Lookup object not swappable"));
 
-	sb = SWAP_PCTRIE_LOOKUP_GE(&object->un_pager.swp.swp_blks,pindex);
-	if (sb == NULL || sb->first > pindex)
+	sb = SWAP_PCTRIE_LOOKUP_LE(&object->un_pager.swp.swp_blks,pindex);
+	if (sb == NULL || sb->last < pindex)
 		return (SWAPBLK_NONE);
 	if(~(sb->daddr | SWAPBLK_MASK) == 0)
 		return sb->daddr;
@@ -2604,11 +2631,15 @@ swap_pager_find_least(vm_object_t object, vm_pindex_t pindex)
 
 	if (pctrie_is_empty(&object->un_pager.swp.swp_blks))
 		return (object->size);
-	sb = SWAP_PCTRIE_LOOKUP_GE(&object->un_pager.swp.swp_blks,pindex);
-	if (sb == NULL)
+	sb = SWAP_PCTRIE_LOOKUP_LE(&object->un_pager.swp.swp_blks,pindex);
+	if (sb == NULL){
+		sb = SWAP_PCTRIE_LOOKUP_GE(&object->un_pager.swp.swp_blks,pindex);
+		if(sb != NULL)
+			return sb->first;
 		return (object->size);
-	if (pindex < sb->first)
-		return sb->first;
+	}
+	if (pindex > sb->last)
+		return sb->last;
 	return pindex;
 }
 
@@ -3050,7 +3081,7 @@ vmspace_swap_count(struct vmspace *vmspace)
 	vm_map_entry_t cur;
 	vm_object_t object;
 	struct swblk *sb;
-	vm_pindex_t e, pi, end;
+	vm_pindex_t e, pi;
 	long count;
 
 	map = &vmspace->vm_map;
@@ -3067,13 +3098,13 @@ vmspace_swap_count(struct vmspace *vmspace)
 			goto unlock;
 		pi = OFF_TO_IDX(cur->offset);
 		e = pi + OFF_TO_IDX(cur->end - cur->start);
-		for (sb = SWAP_PCTRIE_LOOKUP_GE(&object->un_pager.swp.swp_blks, pi);
-			sb != NULL && sb->first < e;
-			sb = SWAP_PCTRIE_LOOKUP_GE(&object->un_pager.swp.swp_blks, pi)) {
-			pi = MAX(sb->first, pi);
-			end = MIN(sb->last, e);
-			count += end-pi + 1;
-			pi = sb->last+1;
+		for (sb = SWAP_PCTRIE_LOOKUP_LE(&object->un_pager.swp.swp_blks, e);
+			sb != NULL && sb->last > pi;
+			sb = SWAP_PCTRIE_LOOKUP_LE(&object->un_pager.swp.swp_blks, e)) {
+			if(~(sb->daddr | SWAPBLK_MASK) != 0){
+				count += MIN(sb->last, e) - MAX(sb->first, pi);
+			}
+			e = sb->first-1;
 		}
 unlock:
 		VM_OBJECT_RUNLOCK(object);

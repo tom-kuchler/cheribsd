@@ -114,9 +114,11 @@ static void checkRangeFault(void* basePointer, size_t size){
         int occured = setjmp(sigReturnEnv);
         if(occured == 0){
             registerSegFaultHandler();
+            size_t readvalue = ((size_t*)basePointer)[accessIndex];
             ((size_t*)basePointer)[accessIndex] = -1;
             // no fault occured
-            ATF_CHECK_MSG(0, "No segfault for index %zu", accessIndex);
+            ATF_CHECK_MSG(0, "No segfault for index %zu, read value: %zu",
+                accessIndex, readvalue);
         } else {
             ATF_CHECK_EQ_MSG(&((size_t*)basePointer)[accessIndex], faultAddress,
                 "access segfault after reusable on wrong address");

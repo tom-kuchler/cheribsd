@@ -4434,6 +4434,9 @@ vm_map_delete(vm_map_t map, vm_offset_t start, vm_offset_t end,
 		if ((map->flags & MAP_RESERVATIONS) != 0 && keep_reservation) {
 			if ((entry->eflags & MAP_ENTRY_UNMAPPED) == 0) {
 				vm_map_entry_clean(map, entry);
+				if ((entry->eflags & MAP_ENTRY_IS_SUB_MAP) == 0)
+					vm_object_deallocate(
+					    entry->object.vm_object);
 				/* XXX-AM: How do we reset maxprot? */
 				vm_map_reservation_init_entry(entry);
 			}
