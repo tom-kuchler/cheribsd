@@ -177,6 +177,9 @@ struct vm_object {
 			struct pctrie swp_tgblks;
 #endif
 			vm_ooffset_t writemappings;
+#ifdef INVARIANTS
+			u_long n_blks;
+#endif
 		} swp;
 
 		/*

@@ -249,6 +249,9 @@ _vm_object_allocate(objtype_t type, vm_pindex_t size, u_int flags,
 #if __has_feature(capabilities)
 		pctrie_init(&object->un_pager.swp.swp_tgblks);
 #endif
+#ifdef INVARIANTS
+		object->un_pager.swp.n_blks = 0;
+#endif
 	}
 
 	/*

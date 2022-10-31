@@ -2206,6 +2206,11 @@ swp_pager_meta_insert(vm_object_t object, vm_pindex_t pindex, vm_size_t count, d
 			old->last = start-1;
 		}
 		if(~(start_free | SWAPBLK_MASK) != 0 && !noFree){
+#ifdef INVARIANTS
+			KASSERT(object->un_pager.swp.n_blks >= number_free,
+				("%s: attempting to free more blocks than accounted for",__func__));
+			object->un_pager.swp.n_blks -= number_free;
+#endif
 			swp_pager_freeswapspace(start_free, number_free);
 		}
 		break;
@@ -2232,6 +2237,11 @@ swp_pager_meta_insert(vm_object_t object, vm_pindex_t pindex, vm_size_t count, d
 		start_free = old->daddr;
 		number_free = MIN(old->last, end)+1 - old->first;
 		if(~(start_free | SWAPBLK_MASK) != 0 && !noFree){
+#ifdef INVARIANTS
+			KASSERT(object->un_pager.swp.n_blks >= number_free,
+				("%s: attempting to free more blocks than accounted for",__func__));
+			object->un_pager.swp.n_blks -= number_free;
+#endif
 			swp_pager_freeswapspace(start_free, number_free);
 		}
 		SWAP_PCTRIE_REMOVE(&object->un_pager.swp.swp_blks, old->first);
@@ -2246,6 +2256,22 @@ swp_pager_meta_insert(vm_object_t object, vm_pindex_t pindex, vm_size_t count, d
 			uma_zfree(swblk_zone, old);
 		}
 	}
+#ifdef INVARIANTS
+	u_long swap_count = 0;
+	for(vm_pindex_t index = 0; index < object->size; ){
+		old = SWAP_PCTRIE_LOOKUP_GE(&object->un_pager.swp.swp_blks, index);
+		if(old == NULL)
+			break;
+		index = old->first+1;
+		if(~(old->daddr | SWAPBLK_MASK) != 0)
+			swap_count += old->last+1 - old->first;
+	}
+	if(~(swapblk | SWAPBLK_MASK) != 0)
+		object->un_pager.swp.n_blks += count;
+	KASSERT(object->un_pager.swp.n_blks == swap_count,
+		("%s: missmatching number of blocks in object: %zu and metadata: %zu",
+		__func__, object->un_pager.swp.n_blks, swap_count));
+#endif
 }
 
 /*
