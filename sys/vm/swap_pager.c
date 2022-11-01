@@ -1352,10 +1352,6 @@ swap_pager_getpages_locked(vm_object_t object, vm_page_t *ma, int count,
 	}
 
 	if(blk == SWAPBLK_ZERO){
-		if(rbehind)
-			*rbehind = 0;
-		if(rahead)
-			*rahead = 0;
 		for(i = 0; i < count; i++){
 			// zero out page
 			if(!(ma[i]->flags & PG_ZERO))
@@ -1373,6 +1369,7 @@ swap_pager_getpages_locked(vm_object_t object, vm_page_t *ma, int count,
 					pmap_zero_page(p);
 				// set page flags
 				vm_page_set_validclean(p, 0, PAGE_SIZE);
+				vm_page_readahead_finish(p);
 			}
 			*rbehind = i - 1;
 		}
@@ -1386,6 +1383,7 @@ swap_pager_getpages_locked(vm_object_t object, vm_page_t *ma, int count,
 					pmap_zero_page(p);
 				// set page flags
 				vm_page_set_validclean(p, 0, PAGE_SIZE);
+				vm_page_readahead_finish(p);
 			}
 			*rahead = i;
 		}

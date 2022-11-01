@@ -36,6 +36,7 @@ ATF_TC_BODY(swap_pager__basic, tc){
     // get RAM size and round up to page alligment
     size_t pageSize = getpagesize();
     size_t ramSize = getRamSize();
+    atf_tc_skip("Swaptest disabled as current implementation overloads system");
     // make sure we ask for more pages than are available
     size_t pageNumber = (ramSize + pageSize - 1) / pageSize + 1024;
     size_t entriesPerPage = pageSize / sizeof(unsigned long);
@@ -64,6 +65,7 @@ ATF_TC_BODY(swap_pager__basic_tags, tc){
     // get RAM size and round up to page alligment
     size_t pageSize = getpagesize();
     size_t ramSize = getRamSize();
+    atf_tc_skip("Swaptest disabled as current implementation overloads system");
     // make sure we ask for more pages than are available
     size_t pageNumber = (ramSize + pageSize - 1) / pageSize + 1024;
     size_t entriesPerPage = pageSize / sizeof(void*);
